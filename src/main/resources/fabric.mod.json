@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "autoupdatelib",
+  "version": "${version}",
+  "name": "AutoUpdateLib",
+  "description": "",
+  "authors": [],
+  "contact": {
+    "repo": "https://github.com/otcathatsya/AutoUpdateLib"
+  },
+  "license": "MIT",
+  "icon": "assets/autoupdatelib/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "main": [
+      "at.cath.autoupdatelib.AutoUpdateLib"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric": "*",
+    "minecraft": "${minecraft_version}"
+  }
+}
