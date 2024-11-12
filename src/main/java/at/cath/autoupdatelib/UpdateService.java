@@ -1,7 +1,8 @@
 package at.cath.autoupdatelib;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import org.slf4j.Logger;
 
 import java.io.FileInputStream;
@@ -24,7 +25,7 @@ import java.util.regex.Pattern;
 public class UpdateService {
     private final HttpClient httpClient;
     private final Logger logger;
-    private final ObjectMapper objectMapper;
+    private final Gson gson;
     private static final Pattern GITHUB_URL_PATTERN =
             Pattern.compile("https://github\\.com/([^/]+)/([^/]+)");
 
@@ -39,7 +40,7 @@ public class UpdateService {
 
         this.logger = logger;
         this.httpClient = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
-        this.objectMapper = new ObjectMapper();
+        this.gson = new Gson();
     }
 
     public record ReleaseInfo(
@@ -74,8 +75,11 @@ public class UpdateService {
                     return null;
                 }
 
-                var releaseData = objectMapper.readTree(response.body());
-                return new ReleaseInfo(releaseData.get("tag_name").asText(), getMainAssetDownloadUrl(releaseData));
+                JsonObject releaseData = gson.fromJson(response.body(), JsonObject.class);
+                return new ReleaseInfo(
+                        releaseData.get("tag_name").getAsString(),
+                        getMainAssetDownloadUrl(releaseData)
+                );
             } catch (Exception e) {
                 logger.error("Exception fetching release info", e);
                 return null;
@@ -121,7 +125,6 @@ public class UpdateService {
         });
     }
 
-    // Workaround for Windows file locking. Thanks Wynntils!
     private static void copyFileWithStreams(Path source, Path target) throws IOException {
         try (FileInputStream inputStream = new FileInputStream(source.toFile());
              FileChannel sourceChannel = inputStream.getChannel();
@@ -140,12 +143,13 @@ public class UpdateService {
         return Optional.of(new String[]{matcher.group(1), matcher.group(2)});
     }
 
-    private String getMainAssetDownloadUrl(JsonNode releaseData) {
-        // Look for the first .jar file that's not a checksum
-        for (JsonNode asset : releaseData.get("assets")) {
-            String name = asset.get("name").asText().toLowerCase();
+    private String getMainAssetDownloadUrl(JsonObject releaseData) {
+        JsonArray assets = releaseData.getAsJsonArray("assets");
+        for (var element : assets) {
+            JsonObject asset = element.getAsJsonObject();
+            String name = asset.get("name").getAsString().toLowerCase();
             if (name.endsWith(".jar")) {
-                return asset.get("browser_download_url").asText();
+                return asset.get("browser_download_url").getAsString();
             }
         }
         return null;

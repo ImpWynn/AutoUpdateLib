@@ -25,11 +25,6 @@ dependencies {
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
-
-    include(implementation "com.fasterxml.jackson.core:jackson-core:${jackson_version}")
-    include(implementation "com.fasterxml.jackson.core:jackson-databind:${jackson_version}")
-    include(implementation "com.fasterxml.jackson.core:jackson-annotations:${jackson_version}")
-
 }
 
 processResources {
