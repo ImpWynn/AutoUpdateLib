@@ -11,3 +11,4 @@ Makes some strict assumptions:
 **TO-DO**
 - Allow user-configured endpoint for checksum matching
 - Ease assumptions by allowing user-configured fields via annotation
+- Remove Jackson deps because apparently the latest MC envs have that already

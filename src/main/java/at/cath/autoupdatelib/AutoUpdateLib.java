@@ -5,26 +5,25 @@ import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.suggestion.Suggestions;
 import com.mojang.brigadier.suggestion.SuggestionsBuilder;
 import net.fabricmc.api.ModInitializer;
-import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.loader.api.metadata.ModMetadata;
 import net.fabricmc.loader.api.metadata.ModOrigin;
-import net.minecraft.server.command.ServerCommandSource;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.net.URISyntaxException;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.regex.Pattern;
 
-import static net.minecraft.server.command.CommandManager.argument;
-import static net.minecraft.server.command.CommandManager.literal;
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument;
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal;
 
 
 public class AutoUpdateLib implements ModInitializer {
@@ -34,15 +33,14 @@ public class AutoUpdateLib implements ModInitializer {
     private final Map<String, UpdateEntry> modsToCheck = new HashMap<>();
     public final Logger logger = LoggerFactory.getLogger(MOD_ID);
     private static final Pattern GITHUB_URL_PATTERN = Pattern.compile("https://github\\.com/([^/]+)/([^/]+)");
-    private static final Path MODS_DIR = FabricLoader.getInstance().getGameDir().resolve("mods");
 
     record UpdateEntry(String githubUrl, String inferredVersion, Path oldJarPath) {
     }
 
     @Override
     public void onInitialize() {
-        logger.info("Initialising AutoUpdateLib");
-        // todo: maybe this is not initialised for all mods due to load order, potentially move to onjoin
+        logger.info("AutoUpdateLib fetching mods...");
+
         FabricLoader.getInstance().getAllMods().forEach(mod -> {
             ModMetadata metadata = mod.getMetadata();
 
@@ -71,22 +69,18 @@ public class AutoUpdateLib implements ModInitializer {
             var modVersion = metadata.getVersion().toString();
 
             // todo: under which circumstances does getPaths() return more than one?
-
-            for (var path : origin.getPaths()) {
-                logger.info("one potential path: {}", path);
-            }
-
             modsToCheck.put(modId, new UpdateEntry(githubUrl, modVersion, origin.getPaths().getFirst()));
             logger.info("Picked up mod {} with version {} for auto-updates from {}", modId, modVersion, githubUrl);
         });
 
-        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> dispatcher.register(literal("autoupdate")
+
+        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> dispatcher.register(literal("autoupdate")
                 .then(argument("modToUpdate", StringArgumentType.string())
                         .suggests(this::suggestMods)
                         .executes(this::updateMod))));
     }
 
-    private CompletableFuture<Suggestions> suggestMods(CommandContext<ServerCommandSource> context,
+    private CompletableFuture<Suggestions> suggestMods(CommandContext<FabricClientCommandSource> context,
                                                        SuggestionsBuilder builder) {
         String input = builder.getRemaining().toLowerCase();
         modsToCheck.keySet().stream()
@@ -95,7 +89,7 @@ public class AutoUpdateLib implements ModInitializer {
         return builder.buildFuture();
     }
 
-    private int updateMod(CommandContext<ServerCommandSource> context) {
+    private int updateMod(CommandContext<FabricClientCommandSource> context) {
         var modId = StringArgumentType.getString(context, "modToUpdate");
         if (!modsToCheck.containsKey(modId)) {
             inform(context, modId, "Mod not found", Formatting.RED);
@@ -105,38 +99,52 @@ public class AutoUpdateLib implements ModInitializer {
         var modInfo = modsToCheck.get(modId);
         UpdateService updateService = new UpdateService(modInfo.githubUrl, logger);
 
-        try {
-            var releaseInfoOpt = updateService.getLatestReleaseInfo();
-            if (releaseInfoOpt.isEmpty()) {
-                inform(context, modId, "Failed to fetch latest release info", Formatting.RED);
-                return 0;
-            }
+        updateService.getLatestReleaseInfo()
+                .thenCompose(releaseInfo -> {
+                    if (releaseInfo == null) {
+                        return inform(context, modId, "Failed to fetch latest release info", Formatting.RED);
+                    }
 
-            var releaseInfo = releaseInfoOpt.get();
-            var releaseVersion = releaseInfo.version();
-            if (releaseVersion.contains(modInfo.inferredVersion)) {
-                inform(context, modId, "Already up to date! (" + modInfo.inferredVersion + " ~= " + releaseVersion + ")",
-                        Formatting.YELLOW);
-                return 0;
-            }
+                    var releaseVersion = releaseInfo.version();
+                    if (releaseVersion.contains(modInfo.inferredVersion)) {
+                        return inform(context, modId,
+                                "Already up to date! (" + modInfo.inferredVersion + " ~= " + releaseVersion + ")",
+                                Formatting.YELLOW);
+                    }
 
-            // todo: construct file path somewhere else?
-            String fileName = modId + "-" + releaseVersion + ".jar";
-            updateService.downloadRelease(releaseInfo, MODS_DIR.resolve(fileName), modInfo.oldJarPath);
-
-        } catch (IOException | URISyntaxException | InterruptedException e) {
-            logger.error("Failed to fetch latest release for mod {}", modId, e);
-            inform(context, modId, "Failed to fetch latest release info", Formatting.RED);
-        }
-
-        inform(context, modId, "Update successful! Restart to apply changes", Formatting.GREEN);
-        Text.literal("").withColor(Formatting.GREEN.getColorValue());
+                    inform(context, modId, "Attempting update from " + modInfo.inferredVersion + " -> " + releaseVersion, Formatting.YELLOW);
+                    return updateService.downloadRelease(releaseInfo, modInfo.oldJarPath)
+                            .thenCompose(success -> {
+                                if (success) {
+                                    return inform(context, modId, "Update successful! Restart to apply changes.", Formatting.GREEN);
+                                } else {
+                                    return inform(context, modId, "Failed to download release", Formatting.RED);
+                                }
+                            });
+                })
+                .exceptionally(throwable -> {
+                    logger.error("Error updating mod {}", modId, throwable);
+                    inform(context, modId, "Unexpected error during update", Formatting.RED);
+                    return null;
+                });
 
         return 1;
     }
 
-    private static void inform(CommandContext<ServerCommandSource> context, String modId, String msg, Formatting colour) {
-        context.getSource().sendFeedback(() -> Text.literal(modId + ": " + msg).withColor(colour.getColorValue()), false);
-    }
 
+    private static CompletableFuture<Void> inform(CommandContext<FabricClientCommandSource> context, String modId, String msg, Formatting colour) {
+        var feedbackMessage = Text.literal(modId + ": " + msg).withColor(colour.getColorValue());
+
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        MinecraftClient.getInstance().execute(() -> {
+            try {
+                context.getSource().sendFeedback(feedbackMessage);
+                future.complete(null);
+            } catch (Exception e) {
+                future.completeExceptionally(e);
+            }
+        });
+
+        return future;
+    }
 }

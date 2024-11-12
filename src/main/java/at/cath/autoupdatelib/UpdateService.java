@@ -4,17 +4,20 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -45,84 +48,87 @@ public class UpdateService {
     ) {
     }
 
-    public Optional<ReleaseInfo> getLatestReleaseInfo()
-            throws IOException, URISyntaxException, InterruptedException {
-        var repoInfo = extractRepoInfo(this.githubUrl);
-        if (repoInfo.isEmpty()) {
-            return Optional.empty();
-        }
+    public CompletableFuture<ReleaseInfo> getLatestReleaseInfo() {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                var repoInfo = extractRepoInfo(this.githubUrl);
+                if (repoInfo.isEmpty()) {
+                    logger.error("Failed to extract repo info from GitHub URL: {}", githubUrl);
+                    return null;
+                }
 
-        var owner = repoInfo.get()[0];
-        var repo = repoInfo.get()[1];
-        logger.debug("Initialized UpdateService for {}/{}", owner, repo);
+                var owner = repoInfo.get()[0];
+                var repo = repoInfo.get()[1];
+                logger.debug("Fetching release info for {}/{}", owner, repo);
 
-        var apiUrl = String.format(
-                "https://api.github.com/repos/%s/%s/releases/latest",
-                owner, repo
-        );
+                var apiUrl = String.format("https://api.github.com/repos/%s/%s/releases/latest", owner, repo);
+                var request = HttpRequest.newBuilder()
+                        .uri(new URI(apiUrl))
+                        .header("Accept", "application/vnd.github.v3+json")
+                        .GET()
+                        .build();
 
-        logger.debug("Fetching release info from: {}", apiUrl);
+                var response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() != 200) {
+                    logger.error("Failed to fetch release info: HTTP {}", response.statusCode());
+                    return null;
+                }
 
-        var request = HttpRequest.newBuilder()
-                .uri(new URI(apiUrl))
-                .header("Accept", "application/vnd.github.v3+json")
-                .GET()
-                .build();
-
-        var response = httpClient.send(
-                request,
-                HttpResponse.BodyHandlers.ofString()
-        );
-
-        if (response.statusCode() != 200) {
-            return Optional.empty();
-        }
-
-        var releaseData = objectMapper.readTree(response.body());
-
-        return Optional.of(new ReleaseInfo(
-                releaseData.get("tag_name").asText(),
-                getMainAssetDownloadUrl(releaseData)));
+                var releaseData = objectMapper.readTree(response.body());
+                return new ReleaseInfo(releaseData.get("tag_name").asText(), getMainAssetDownloadUrl(releaseData));
+            } catch (Exception e) {
+                logger.error("Exception fetching release info", e);
+                return null;
+            }
+        });
     }
 
-    /**
-     * Downloads the release asset to the specified location
-     *
-     * @param releaseInfo Release information from getLatestReleaseInfo
-     * @param targetPath  Where to save the downloaded file
-     * @throws IOException        If there's an error downloading or saving the file
-     * @throws URISyntaxException If the download URL is malformed
-     */
-    public void downloadRelease(ReleaseInfo releaseInfo, Path targetPath, Path oldJarPath)
-            throws IOException, URISyntaxException, InterruptedException {
-        logger.debug("Downloading release from: {}", releaseInfo.downloadUrl);
-        logger.debug("Target path: {}", targetPath);
+    public CompletableFuture<Boolean> downloadRelease(ReleaseInfo releaseInfo, Path oldJarPath) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                logger.debug("Downloading release from: {}", releaseInfo.downloadUrl);
 
-        var request = HttpRequest.newBuilder()
-                .uri(new URI(releaseInfo.downloadUrl))
-                .GET()
-                .build();
+                var request = HttpRequest.newBuilder()
+                        .uri(new URI(releaseInfo.downloadUrl))
+                        .GET()
+                        .build();
 
-        var response = httpClient.send(
-                request,
-                HttpResponse.BodyHandlers.ofInputStream()
-        );
-
-        if (response.statusCode() != 200) {
-            throw new IOException("Failed to download release: HTTP " +
-                    response.statusCode());
-        }
-
-        try (InputStream in = response.body()) {
-            Files.copy(in, targetPath, StandardCopyOption.REPLACE_EXISTING);
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                try {
-                    Files.deleteIfExists(oldJarPath);
-                    logger.debug("Deleted old jar file: {}", oldJarPath);
-                } catch (IOException e) {
-                    logger.error("Failed to delete old jar file: {}, {}", oldJarPath, e);
+                var response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+                if (response.statusCode() != 200) {
+                    logger.error("Failed to download release: HTTP {}", response.statusCode());
+                    return false;
                 }
-            }));
+
+                try (InputStream in = response.body()) {
+                    Path tempJar = Files.createTempFile("latest", ".jar");
+                    Files.copy(in, tempJar, StandardCopyOption.REPLACE_EXISTING);
+
+                    Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                        try {
+                            copyFileWithStreams(tempJar, oldJarPath);
+                            Files.deleteIfExists(tempJar);
+                            logger.info("Successfully deleted old jar: {}", oldJarPath);
+                        } catch (IOException e) {
+                            logger.error("Failed to delete old jar: {}", oldJarPath, e);
+                        }
+                    }));
+                    return true;
+                }
+            } catch (Exception e) {
+                logger.error("Exception during downloadRelease", e);
+                return false;
+            }
+        });
+    }
+
+    // Workaround for Windows file locking. Thanks Wynntils!
+    private static void copyFileWithStreams(Path source, Path target) throws IOException {
+        try (FileInputStream inputStream = new FileInputStream(source.toFile());
+             FileChannel sourceChannel = inputStream.getChannel();
+             FileOutputStream outputStream = new FileOutputStream(target.toFile());
+             FileChannel destinationChannel = outputStream.getChannel()) {
+
+            destinationChannel.transferFrom(sourceChannel, 0, sourceChannel.size());
         }
     }
 
